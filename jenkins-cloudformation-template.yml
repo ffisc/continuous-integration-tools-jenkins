@@ -1,0 +1,175 @@
+Description: An EC2 instance running Jenkins CI Server as a Docker container
+
+Parameters:
+  InstanceType:
+    Type: String
+    Description: The size to use for the EC2 instance
+    Default: t3.2xlarge
+    AllowedValues:
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - t3.2xlarge
+    ConstraintDescription: Must be a valid EC2 instance type.
+
+Resources:
+  Role:
+    Type: AWS::IAM::Role
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ec2.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+
+  Profile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      Path: /
+      Roles: [!Ref Role]
+
+  SecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Allow TCP traffic on port 80
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+
+  Server:
+    Type: AWS::EC2::Instance
+
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+
+    Metadata:
+      'AWS::CloudFormation::Init':
+        configSets:
+          application_installation:
+            - install_cfn
+            - install_apps
+        install_cfn:
+          files:
+            /etc/systemd/system/ci.service:
+              content: |
+                [Unit]
+                Description=ci
+                [Service]
+                ExecStart=/usr/bin/docker start jenkins
+                Restart=on-failure
+                [Install]
+                WantedBy=multi-user.target
+              mode: '000400'
+              owner: root
+              group: root            
+
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+              mode: '000400'
+              owner: root
+              group: root            
+            
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.Server.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v
+                      --stack ${AWS::StackName}
+                      --resource Server
+                      --configsets application_installation
+                      --region ${AWS::Region}
+              mode: '000400'
+              owner: root
+              group: root
+          
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: 'true'
+                ensureRunning: 'true'
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+        
+        install_apps:
+          packages:
+            yum:
+              docker: []
+          services:
+            sysvinit:
+              docker:
+                enabled: 'true'
+                ensureRunning: 'true'
+
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-ebs}}"
+      IamInstanceProfile: !Ref Profile
+      SecurityGroups:
+        - !Ref SecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}
+
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash -xe
+            exec > >(tee /var/log/user-data.log) 2>&1
+
+            yum update -y aws-cfn-bootstrap
+            
+            /opt/aws/bin/cfn-init -v \
+              --stack ${AWS::StackName} \
+              --region ${AWS::Region} \
+              --resource Server \
+              --configsets application_installation
+            
+            docker volume create jenkins_home &&
+            
+            docker run --detach \
+              --name jenkins \
+              --volume jenkins_home:/var/jenkins_home \
+              --publish 80:8080 \
+              jenkins/jenkins:lts
+
+            systemctl daemon-reload
+            systemctl enable ci.service
+        
+            # https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html
+            docker exec --user=root jenkins apt update -y
+            docker exec --user=root jenkins apt install -y zip python3 python3-venv python3-pip
+            docker exec --user=root jenkins curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            docker exec --user=root jenkins unzip awscliv2.zip
+            docker exec --user=root jenkins ./aws/install
+            docker exec --user=root jenkins python3 --version && pip3 --version && aws --version
+
+            /opt/aws/bin/cfn-signal -e $? \
+              --stack ${AWS::StackName} \
+              --region ${AWS::Region} \
+              --resource Server
+
+  ElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      InstanceId: !Ref Server
+
+Outputs:
+  URL:
+    Value: !Sub 'http://${Server.PublicDnsName}/'
+    Description: Application URL
+  AdminPassword:
+    Value: 'sudo docker logs jenkins'
+    Description: Connect to the server and run this command to get the initial admin password
